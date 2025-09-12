@@ -386,7 +386,7 @@ function Wait-ForADReplication {
                 throw "AD replication timeout for computer: $ComputerName"
             }
             
-            Write-Log DEBUG "Attempt $Attempt/$MaxRetries: Computer not yet visible, waiting ${RetryIntervalSeconds}s..."
+            Write-Log DEBUG "Attempt $Attempt of $MaxRetries`: Computer not yet visible, waiting ${RetryIntervalSeconds}s..."
             Start-Sleep -Seconds $RetryIntervalSeconds
         }
     }

@@ -1,0 +1,7 @@
+# Generated log files
+Logs/
+*.log
+*.txt
+
+# PowerShell transcript files
+Transcript_*.txt
