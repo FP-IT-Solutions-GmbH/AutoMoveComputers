@@ -494,8 +494,12 @@ function Stop-ScriptExecution {
 Start-LoggingSession
 
 try {
-    # Initialize Active Directory module
-    Initialize-ADModule
+    # Initialize Active Directory module (skip in simulate mode for testing)
+    if (-not $Simulate) {
+        Initialize-ADModule
+    } else {
+        Write-Log INFO "SIMULATION MODE: Skipping ActiveDirectory module initialization"
+    }
     
     # Determine target computer
     $Creator = 'Unknown'
@@ -540,7 +544,21 @@ try {
         }
     }
     
-    # Wait for AD replication
+    # In simulate mode, skip AD operations and just test routing logic
+    if ($Simulate) {
+        Write-Log INFO "SIMULATION MODE: Skipping Active Directory operations"
+        
+        # Determine target OU using routing rules only
+        $TargetOU = Resolve-TargetOU -ComputerName $ComputerName
+        if (-not $TargetOU) {
+            Stop-ScriptExecution -ExitCode 0 -Message "SIMULATION: No routing rule matched for '$ComputerName' - no action would be taken"
+        }
+        
+        Write-Log INFO "SIMULATION: Computer '$ComputerName' would be moved to '$TargetOU' (Creator: $Creator)"
+        Stop-ScriptExecution -ExitCode 0 -Message "SIMULATION: Computer '$ComputerName' routing test completed successfully"
+    }
+    
+    # Wait for AD replication (only in non-simulate mode)
     try {
         $ADComputer = Wait-ForADReplication -ComputerName $ComputerName
     }
@@ -554,12 +572,11 @@ try {
         Stop-ScriptExecution -ExitCode 0 -Message "No routing rule matched for '$ComputerName' - no action taken"
     }
     
-    # Move computer to target OU
-    $MoveResult = Move-ComputerToOU -Computer $ADComputer -TargetOU $TargetOU -Creator $Creator -WhatIf:$Simulate
+    # Move computer to target OU (this will be WhatIf since we're not in simulate mode here)
+    $MoveResult = Move-ComputerToOU -Computer $ADComputer -TargetOU $TargetOU -Creator $Creator -WhatIf:$false
     
     if ($MoveResult) {
-        $Action = if ($Simulate) { "Would move" } else { "Moved" }
-        Stop-ScriptExecution -ExitCode 0 -Message "$Action computer '$ComputerName' successfully"
+        Stop-ScriptExecution -ExitCode 0 -Message "Moved computer '$ComputerName' successfully"
     }
     else {
         Stop-ScriptExecution -ExitCode 50 -Message "Failed to move computer '$ComputerName'"

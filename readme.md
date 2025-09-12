@@ -86,8 +86,13 @@ Get-Content "C:\Scripts\Logs\AutoMove-Computer.log" | Select-String "Session Sta
 # Erfolgreiche Moves anzeigen
 Get-Content "C:\Scripts\Logs\AutoMove-Computer.log" | Select-String "SUCCESS.*Moved" | Select -Last 20
 
-# Test-Modus für neue Regeln
-.\AutoMove-Computer.ps1 -ComputerName "TestComputer" -Simulate -Verbose
+# Echte Simulation für neue Regeln (ohne AD-Zugriff)
+.\AutoMove-Computer.ps1 -ComputerName "TestComputer" -Simulate
+
+# Routing-Test für mehrere Computer
+@('ALPHA-PC001', 'BETA-WS002', 'LAB-SYSTEM01', 'UNKNOWN-PC') | ForEach-Object {
+    .\AutoMove-Computer.ps1 -ComputerName $_ -Simulate
+}
 ```
 
 ### Performance-Optimierung
@@ -133,6 +138,29 @@ Get-Content "C:\Scripts\Logs\AutoMove-Computer.log" | Select-String "SUCCESS.*Mo
 1. Neue Script-Datei einsetzen
 2. Optional: `Config.psd1` für angepasste Einstellungen erstellen
 3. Keine Änderungen an Task Scheduler oder GPO erforderlich
+
+### Version 2.1 (September 2025)
+**Verbesserter Simulation-Modus:**
+
+#### Fixes
+- **Echte Simulation**: `-Simulate` Modus führt jetzt keine AD-Operationen aus
+- **Keine AD-Abhängigkeit**: Simulation funktioniert ohne ActiveDirectory-Modul
+- **Sofortige Ausführung**: Keine Wartezeiten auf AD-Replikation in Simulation
+- **Bessere Tests**: Ermöglicht vollständige Regel-Tests ohne AD-Umgebung
+
+#### Vorher (v2.0)
+```
+# Wartete trotz -Simulate auf AD-Replikation
+AutoMove-Computer.ps1 -ComputerName "Test" -Simulate
+# -> Timeout nach 60s wenn Computer nicht in AD existiert
+```
+
+#### Nachher (v2.1)
+```
+# Sofortige Simulation ohne AD-Zugriff
+AutoMove-Computer.ps1 -ComputerName "Test" -Simulate
+# -> Sofortige Ausgabe der Routing-Entscheidung
+```
 
 --- **Namens**.  
 Die Ausführung erfolgt **ereignisgesteuert**, sobald auf dem Domain Controller ein **Security-Event 5137** (Neues Objekt erstellt) protokolliert wird.
@@ -261,12 +289,19 @@ Das Script unterstützt jetzt eine externe Konfigurationsdatei `Config.psd1` im 
 # Standard Task Scheduler Aufruf
 AutoMove-Computer.ps1 -RecordId "$(EventRecordID)"
 
-# Manueller Test mit Simulation
+# Echte Simulation - testet nur Routing-Regeln ohne AD-Zugriff
 AutoMove-Computer.ps1 -ComputerName "Alpha-PC001" -Simulate
 
 # Benutzerdefinierte Konfigurationsdatei
 AutoMove-Computer.ps1 -RecordId "12345" -ConfigFile "C:\Custom\MyConfig.psd1"
 ```
+
+**Wichtig:** Der `-Simulate` Modus ist eine echte Simulation, die:
+- ✅ Keine Active Directory-Module benötigt
+- ✅ Keine AD-Verbindung aufbaut
+- ✅ Keine Computer im AD sucht
+- ✅ Nur Routing-Regeln testet und loggt
+- ✅ Sofort terminiert ohne Wartezeiten
 
 ---
 
