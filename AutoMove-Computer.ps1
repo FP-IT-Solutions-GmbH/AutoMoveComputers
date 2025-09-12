@@ -1,170 +1,573 @@
-﻿<#  AutoMove-Computer.ps1  (PowerShell 5.1 compatible)
-    Event-driven OU routing for NEW AD computer objects (Security Event 5137).
+﻿<#
+.SYNOPSIS
+    Event-driven OU routing for new AD computer objects (Security Event 5137).
 
-    - Logs to .\Logs\AutoMove-Computer.log (next to this script)
-    - Accepts RecordId as raw string (from Task macro) or manual -ComputerName override
-    - Rules: name prefix Alpha/Beta/Gamma -> target OU
-    - Optional fallback rule to a quarantine OU
+.DESCRIPTION
+    This script automatically moves newly created computer objects to appropriate OUs based on naming patterns.
+    It responds to Security Event 5137 (object creation) and applies configurable routing rules.
 
+.PARAMETER RecordId
+    Event Record ID from Task Scheduler macro "$(EventRecordID)" or manual numeric value.
+
+.PARAMETER ComputerName  
+    Manual computer name override for testing purposes (bypasses event lookup).
+
+.PARAMETER Simulate
+    Simulation mode - logs intended actions without actually moving computers.
+
+.PARAMETER ConfigFile
+    Path to configuration file (defaults to Config.psd1 next to script).
+
+.EXAMPLE
+    AutoMove-Computer.ps1 -RecordId "$(EventRecordID)"
+    Standard usage from Task Scheduler.
+
+.EXAMPLE
+    AutoMove-Computer.ps1 -ComputerName "Alpha-PC001" -Simulate
+    Test mode with specific computer name.
+
+.NOTES
+    Version: 2.0
+    Requires: ActiveDirectory PowerShell module
+    Log Location: .\Logs\AutoMove-Computer.log
+    
     Task Scheduler Action:
     Program:   C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
     Arguments: -NoProfile -ExecutionPolicy Bypass -File "C:\Scripts\AutoMove-Computer.ps1" -RecordId "$(EventRecordID)"
     Start in:  C:\Scripts
 #>
 
+[CmdletBinding()]
 param(
-  [string]$RecordId,            # may be "$(EventRecordID)" or a number
-  [string]$ComputerName,        # manual override for testing
-  [switch]$Simulate             # don't move, only log intended action
+    [Parameter(ParameterSetName='Event')]
+    [string]$RecordId,
+
+    [Parameter(ParameterSetName='Manual')]
+    [string]$ComputerName,
+
+    [switch]$Simulate,
+
+    [string]$ConfigFile
 )
 
 $ErrorActionPreference = 'Stop'
 
-# --- Resolve script path/dirs even if started oddly ---
-$ScriptPath = if ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { $PSCommandPath }
-if (-not $ScriptPath) { $ScriptPath = 'C:\Scripts\AutoMove-Computer.ps1' }
-$ScriptDir  = Split-Path -Parent $ScriptPath
+#region Configuration and Initialization
 
-# --- Logging ---
-$LogDir  = Join-Path $ScriptDir 'Logs'
-$LogFile = Join-Path $LogDir  'AutoMove-Computer.log'
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-function Write-Log {
-  param([string]$Level,[string]$Msg)
-  $ts=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
-  Add-Content -Path $LogFile -Value ("{0} [{1}] {2}" -f $ts,$Level.ToUpper(),$Msg)
+# Resolve script path and directories
+$Script:ScriptPath = if ($MyInvocation.MyCommand.Path) { 
+    $MyInvocation.MyCommand.Path 
+} else { 
+    $PSCommandPath 
+}
+if (-not $Script:ScriptPath) { 
+    throw "Unable to determine script path. Run script from file system."
+}
+$Script:ScriptDir = Split-Path -Parent $Script:ScriptPath
+
+# Configuration
+$Script:Config = @{
+    LogDir = Join-Path $Script:ScriptDir 'Logs'
+    MaxLogSizeMB = 10
+    ReplicationTimeoutSeconds = 60
+    ReplicationRetryIntervalSeconds = 5
+    EventLookupMinutes = 5
+    MaxEvents = 500
+    EnableTranscript = $true
 }
 
-# optional transcript for deep debugging
-try {
-  $TranscriptPath = Join-Path $LogDir ("Transcript_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
-  Start-Transcript -Path $TranscriptPath -Force | Out-Null
-} catch {}
+# Load external config if specified or exists
+$DefaultConfigPath = Join-Path $Script:ScriptDir 'Config.psd1'
+$ConfigPath = if ($ConfigFile) { $ConfigFile } elseif (Test-Path $DefaultConfigPath) { $DefaultConfigPath }
 
-Write-Log INFO "----- Task trigger start -----"
-Write-Log INFO ("Host={0} User={1} PS={2} RecordIdRaw='{3}' ComputerNameOverride='{4}' Simulate={5}" -f `
-  $env:COMPUTERNAME, [System.Security.Principal.WindowsIdentity]::GetCurrent().Name, $PSVersionTable.PSVersion, $RecordId, $ComputerName, [bool]$Simulate)
-
-# --- Import AD module (required) ---
-try {
-  Import-Module ActiveDirectory -ErrorAction Stop
-  Write-Log INFO "ActiveDirectory module imported."
-} catch {
-  Write-Log ERROR ("ActiveDirectory module not available: {0}" -f $_.Exception.Message)
-  Stop-Transcript | Out-Null
-  exit 10
-}
-
-# --- Routing rules (edit to your environment) ---
-$Rules = @(
-  @{ Pattern = '^Alpha'; OU = 'OU=Location Alpha,OU=Computers,OU=DEV Company,DC=dev,DC=local' }
-  @{ Pattern = '^Beta';  OU = 'OU=Location Beta,OU=Computers,OU=DEV Company,DC=dev,DC=local' }
-  @{ Pattern = '^Gamma'; OU = 'OU=Location Gamma,OU=Computers,OU=DEV Company,DC=dev,DC=local' }
-  @{ Pattern = '.*';     OU = 'OU=_Quarantine,OU=Computers,OU=DEV Company,DC=dev,DC=local' } # optional fallback
-)
-
-# --- Helpers ---
-function Get-5137ByRecordId {
-  param([long]$Rid)
-  Get-WinEvent -LogName Security -MaxEvents 500 |
-    Where-Object { $_.Id -eq 5137 -and $_.RecordId -eq $Rid } |
-    Select-Object -First 1
-}
-function Get-Recent5137Computer {
-  param([datetime]$Since)
-  Get-WinEvent -FilterHashtable @{LogName='Security'; Id=5137; StartTime=$Since} |
-    Where-Object {
-      $x = [xml]$_.ToXml()
-      ($x.Event.EventData.Data | Where-Object { $_.Name -eq 'ObjectClass' }).'#text' -eq 'computer'
-    } | Select-Object -First 1
-}
-function Resolve-TargetOU {
-  param([string]$Name)
-  foreach ($r in $Rules) { if ($Name -match $r.Pattern) { return $r.OU } }
-  return $null
-}
-
-# --- Determine ComputerName (override OR from event 5137) ---
-$Creator = $null
-if ($ComputerName) {
-  Write-Log INFO "Override mode: using ComputerName='$ComputerName' (skipping event lookup)."
-} else {
-  $RecordIdParsed = $null
-  if ($RecordId -match '^\d+$') { $RecordIdParsed = [long]$RecordId }
-
-  $evt = $null
-  if ($RecordIdParsed) {
-    $evt = Get-5137ByRecordId -Rid $RecordIdParsed
-    if ($evt) { Write-Log INFO "Matched Security 5137 by RecordId=$RecordIdParsed" }
-  }
-  if (-not $evt) {
-    $since = (Get-Date).AddMinutes(-5)
-    Write-Log WARN "No event by RecordId. Falling back to search since $since"
-    $evt = Get-Recent5137Computer -Since $since
-    if (-not $evt) {
-      Write-Log ERROR "No recent 5137 computer event found. Exiting."
-      Stop-Transcript | Out-Null; exit 20
+if ($ConfigPath -and (Test-Path $ConfigPath)) {
+    try {
+        $ExternalConfig = Import-PowerShellDataFile -Path $ConfigPath
+        foreach ($key in $ExternalConfig.Keys) {
+            $Script:Config[$key] = $ExternalConfig[$key]
+        }
+        Write-Verbose "Loaded configuration from: $ConfigPath"
     }
-  }
-  [xml]$x = $evt.ToXml()
-  $edata = @{}; foreach ($d in $x.Event.EventData.Data) { $edata[$d.Name] = [string]$d.'#text' }
-  if ($edata['ObjectClass'] -ne 'computer') {
-    Write-Log INFO "Event ObjectClass is '$($edata['ObjectClass'])'. Exit."
-    Stop-Transcript | Out-Null; exit 0
-  }
-  $dn = $edata['ObjectDN']
-  $ComputerName = ($dn -split ',')[0] -replace '^CN=',''
-  $Creator = ('{0}\{1}' -f $edata['SubjectDomainName'],$edata['SubjectUserName'])
-  Write-Log INFO ("New computer from event: Name={0} DN={1} Creator={2}" -f $ComputerName,$dn,($Creator))
+    catch {
+        Write-Warning "Failed to load config file '$ConfigPath': $($_.Exception.Message)"
+    }
 }
 
-# --- Wait for replication visibility (up to 60s) ---
-$ad = $null
-foreach ($i in 1..12) {
-  try {
-    $ad = Get-ADComputer -Identity $ComputerName -Properties DistinguishedName,whenCreated -ErrorAction Stop
-    break
-  } catch { Start-Sleep -Seconds 5 }
-}
-if (-not $ad) {
-  Write-Log ERROR "Computer '$ComputerName' not visible in AD after 60s. Exiting."
-  Stop-Transcript | Out-Null; exit 30
+# Default routing rules (can be overridden in config file)
+if (-not $Script:Config.Rules) {
+    $Script:Config.Rules = @(
+        @{ Pattern = '^Alpha'; OU = 'OU=Location Alpha,OU=Computers,OU=DEV Company,DC=dev,DC=local'; Description = 'Alpha location computers' }
+        @{ Pattern = '^Beta';  OU = 'OU=Location Beta,OU=Computers,OU=DEV Company,DC=dev,DC=local'; Description = 'Beta location computers' }
+        @{ Pattern = '^Gamma'; OU = 'OU=Location Gamma,OU=Computers,OU=DEV Company,DC=dev,DC=local'; Description = 'Gamma location computers' }
+        @{ Pattern = '.*';     OU = 'OU=_Quarantine,OU=Computers,OU=DEV Company,DC=dev,DC=local'; Description = 'Fallback quarantine' }
+    )
 }
 
-# --- Determine destination OU ---
-$TargetOU = Resolve-TargetOU -Name $ComputerName
-if (-not $TargetOU) {
-  Write-Log WARN "No routing rule matched for '$ComputerName'. Exiting."
-  Stop-Transcript | Out-Null; exit 0
+#endregion
+
+#region Logging Functions
+
+# Initialize logging
+$Script:LogFile = Join-Path $Script:Config.LogDir 'AutoMove-Computer.log'
+if (-not (Test-Path $Script:Config.LogDir)) { 
+    New-Item -ItemType Directory -Path $Script:Config.LogDir -Force | Out-Null 
 }
 
-# Already in target?
-if ($ad.DistinguishedName -like "*$TargetOU") {
-  Write-Log INFO ("{0} already in {1}. Nothing to do." -f $ComputerName,$TargetOU)
-  Stop-Transcript | Out-Null; exit 0
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Writes timestamped log entries to the log file.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS', 'DEBUG')]
+        [string]$Level,
+        
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+    
+    $Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+    $LogEntry = "{0} [{1}] {2}" -f $Timestamp, $Level.ToUpper(), $Message
+    
+    try {
+        # Rotate log if too large
+        if ((Test-Path $Script:LogFile) -and ((Get-Item $Script:LogFile).Length -gt ($Script:Config.MaxLogSizeMB * 1MB))) {
+            $BackupLog = $Script:LogFile -replace '\.log$', "_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+            Move-Item -Path $Script:LogFile -Destination $BackupLog -Force
+            Write-Host "Rotated log file to: $BackupLog" -ForegroundColor Yellow
+        }
+        
+        Add-Content -Path $Script:LogFile -Value $LogEntry -Encoding UTF8
+        
+        # Also write to console for immediate feedback
+        $Color = switch ($Level) {
+            'ERROR' { 'Red' }
+            'WARN' { 'Yellow' }
+            'SUCCESS' { 'Green' }
+            'DEBUG' { 'Cyan' }
+            default { 'White' }
+        }
+        Write-Host $LogEntry -ForegroundColor $Color
+    }
+    catch {
+        Write-Error "Failed to write to log: $($_.Exception.Message)"
+    }
 }
 
-# Ensure OU exists
-try { $null = Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop }
-catch {
-  Write-Log ERROR ("Target OU not found: {0} — {1}" -f $TargetOU,$_.Exception.Message)
-  Stop-Transcript | Out-Null; exit 40
+function Start-LoggingSession {
+    <#
+    .SYNOPSIS
+        Initializes the logging session with system information.
+    #>
+    Write-Log INFO "----- AutoMove-Computer Session Started -----"
+    Write-Log INFO "Host: $env:COMPUTERNAME"
+    Write-Log INFO "User: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+    Write-Log INFO "PowerShell: $($PSVersionTable.PSVersion)"
+    Write-Log INFO "Script: $Script:ScriptPath"
+    Write-Log INFO "Parameters: RecordId='$RecordId' ComputerName='$ComputerName' Simulate=$([bool]$Simulate)"
+    
+    if ($Script:Config.EnableTranscript) {
+        try {
+            $TranscriptPath = Join-Path $Script:Config.LogDir "Transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+            Start-Transcript -Path $TranscriptPath -Force | Out-Null
+            Write-Log INFO "Transcript started: $TranscriptPath"
+        }
+        catch {
+            Write-Log WARN "Failed to start transcript: $($_.Exception.Message)"
+        }
+    }
 }
 
-# --- Move or simulate ---
-if ($Simulate) {
-  Write-Log INFO ("SIMULATE move: {0}  -->  {1}" -f $ad.DistinguishedName,$TargetOU)
-  Stop-Transcript | Out-Null; exit 0
+#endregion
+
+#region Active Directory Module
+
+function Initialize-ADModule {
+    <#
+    .SYNOPSIS
+        Imports and validates the Active Directory PowerShell module.
+    #>
+    try {
+        if (-not (Get-Module -Name ActiveDirectory)) {
+            Import-Module ActiveDirectory -ErrorAction Stop
+        }
+        Write-Log INFO "ActiveDirectory module loaded successfully"
+        
+        # Test AD connectivity
+        $null = Get-ADDomain -ErrorAction Stop
+        Write-Log INFO "Active Directory connectivity verified"
+    }
+    catch {
+        Write-Log ERROR "ActiveDirectory module initialization failed: $($_.Exception.Message)"
+        throw "ActiveDirectory module required but not available"
+    }
 }
+
+#endregion
+
+#region Event Processing Functions
+
+function Get-SecurityEvent5137ByRecordId {
+    <#
+    .SYNOPSIS
+        Retrieves Security Event 5137 by Record ID.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [long]$RecordId
+    )
+    
+    try {
+        $Event = Get-WinEvent -LogName Security -MaxEvents $Script:Config.MaxEvents |
+            Where-Object { $_.Id -eq 5137 -and $_.RecordId -eq $RecordId } |
+            Select-Object -First 1
+            
+        if ($Event) {
+            Write-Log INFO "Found Security Event 5137 with RecordId: $RecordId"
+            return $Event
+        }
+        else {
+            Write-Log WARN "No Security Event 5137 found with RecordId: $RecordId"
+            return $null
+        }
+    }
+    catch {
+        Write-Log ERROR "Failed to retrieve event by RecordId $RecordId : $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-RecentComputerCreationEvent {
+    <#
+    .SYNOPSIS
+        Retrieves the most recent computer creation event (5137).
+    #>
+    [CmdletBinding()]
+    param(
+        [datetime]$Since = (Get-Date).AddMinutes(-$Script:Config.EventLookupMinutes)
+    )
+    
+    try {
+        Write-Log INFO "Searching for recent computer creation events since: $Since"
+        
+        $Events = Get-WinEvent -FilterHashtable @{
+            LogName = 'Security'
+            Id = 5137
+            StartTime = $Since
+        } -ErrorAction SilentlyContinue
+        
+        foreach ($Event in $Events) {
+            try {
+                $EventXml = [xml]$Event.ToXml()
+                $ObjectClass = ($EventXml.Event.EventData.Data | Where-Object { $_.Name -eq 'ObjectClass' }).'#text'
+                
+                if ($ObjectClass -eq 'computer') {
+                    Write-Log INFO "Found recent computer creation event (RecordId: $($Event.RecordId))"
+                    return $Event
+                }
+            }
+            catch {
+                Write-Log WARN "Failed to parse event RecordId $($Event.RecordId): $($_.Exception.Message)"
+            }
+        }
+        
+        Write-Log WARN "No recent computer creation events found since $Since"
+        return $null
+    }
+    catch {
+        Write-Log ERROR "Failed to search for recent events: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function ConvertFrom-SecurityEvent5137 {
+    <#
+    .SYNOPSIS
+        Extracts computer information from Security Event 5137.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Eventing.Reader.EventLogRecord]$Event
+    )
+    
+    try {
+        $EventXml = [xml]$Event.ToXml()
+        $EventData = @{}
+        
+        foreach ($Data in $EventXml.Event.EventData.Data) {
+            $EventData[$Data.Name] = [string]$Data.'#text'
+        }
+        
+        if ($EventData['ObjectClass'] -ne 'computer') {
+            throw "Event is not for a computer object (ObjectClass: $($EventData['ObjectClass']))"
+        }
+        
+        $DistinguishedName = $EventData['ObjectDN']
+        $ComputerName = ($DistinguishedName -split ',')[0] -replace '^CN=', ''
+        $Creator = if ($EventData['SubjectDomainName'] -and $EventData['SubjectUserName']) {
+            "$($EventData['SubjectDomainName'])\$($EventData['SubjectUserName'])"
+        } else {
+            'Unknown'
+        }
+        
+        return @{
+            ComputerName = $ComputerName
+            DistinguishedName = $DistinguishedName
+            Creator = $Creator
+            EventData = $EventData
+        }
+    }
+    catch {
+        Write-Log ERROR "Failed to parse Security Event 5137: $($_.Exception.Message)"
+        throw
+    }
+}
+
+#endregion
+
+#region Computer Processing Functions
+
+function Resolve-TargetOU {
+    <#
+    .SYNOPSIS
+        Determines the target OU for a computer based on routing rules.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
+    
+    Write-Log INFO "Evaluating routing rules for computer: $ComputerName"
+    
+    foreach ($Rule in $Script:Config.Rules) {
+        if ($ComputerName -match $Rule.Pattern) {
+            $Description = if ($Rule.Description) { " ($($Rule.Description))" } else { "" }
+            Write-Log INFO "Matched rule '$($Rule.Pattern)' -> $($Rule.OU)$Description"
+            return $Rule.OU
+        }
+    }
+    
+    Write-Log WARN "No routing rules matched for computer: $ComputerName"
+    return $null
+}
+
+function Wait-ForADReplication {
+    <#
+    .SYNOPSIS
+        Waits for computer object to become visible in AD after creation.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+        
+        [int]$TimeoutSeconds = $Script:Config.ReplicationTimeoutSeconds,
+        [int]$RetryIntervalSeconds = $Script:Config.ReplicationRetryIntervalSeconds
+    )
+    
+    Write-Log INFO "Waiting for AD replication of computer: $ComputerName (timeout: ${TimeoutSeconds}s)"
+    
+    $MaxRetries = [math]::Ceiling($TimeoutSeconds / $RetryIntervalSeconds)
+    
+    for ($Attempt = 1; $Attempt -le $MaxRetries; $Attempt++) {
+        try {
+            $Computer = Get-ADComputer -Identity $ComputerName -Properties DistinguishedName, whenCreated -ErrorAction Stop
+            Write-Log SUCCESS "Computer '$ComputerName' found in AD after $($Attempt * $RetryIntervalSeconds) seconds"
+            return $Computer
+        }
+        catch {
+            if ($Attempt -eq $MaxRetries) {
+                Write-Log ERROR "Computer '$ComputerName' not visible in AD after $TimeoutSeconds seconds"
+                throw "AD replication timeout for computer: $ComputerName"
+            }
+            
+            Write-Log DEBUG "Attempt $Attempt/$MaxRetries: Computer not yet visible, waiting ${RetryIntervalSeconds}s..."
+            Start-Sleep -Seconds $RetryIntervalSeconds
+        }
+    }
+}
+
+function Test-ADOrganizationalUnit {
+    <#
+    .SYNOPSIS
+        Validates that the target OU exists in Active Directory.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DistinguishedName
+    )
+    
+    try {
+        $null = Get-ADOrganizationalUnit -Identity $DistinguishedName -ErrorAction Stop
+        Write-Log INFO "Target OU validated: $DistinguishedName"
+        return $true
+    }
+    catch {
+        Write-Log ERROR "Target OU not found or inaccessible: $DistinguishedName - $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Move-ComputerToOU {
+    <#
+    .SYNOPSIS
+        Moves a computer object to the specified OU.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [Microsoft.ActiveDirectory.Management.ADComputer]$Computer,
+        
+        [Parameter(Mandatory)]
+        [string]$TargetOU,
+        
+        [string]$Creator = 'Unknown',
+        [switch]$WhatIf
+    )
+    
+    $ComputerName = $Computer.Name
+    $CurrentDN = $Computer.DistinguishedName
+    
+    # Check if already in target OU
+    if ($CurrentDN -like "*$TargetOU") {
+        Write-Log INFO "Computer '$ComputerName' already in target OU: $TargetOU"
+        return $true
+    }
+    
+    # Validate target OU exists
+    if (-not (Test-ADOrganizationalUnit -DistinguishedName $TargetOU)) {
+        return $false
+    }
+    
+    if ($WhatIf) {
+        Write-Log INFO "[SIMULATION] Would move: $CurrentDN -> $TargetOU"
+        return $true
+    }
+    
+    try {
+        Write-Log INFO "Moving computer: $CurrentDN -> $TargetOU"
+        Move-ADObject -Identity $CurrentDN -TargetPath $TargetOU -Confirm:$false -ErrorAction Stop
+        Write-Log SUCCESS "Successfully moved '$ComputerName' to '$TargetOU' (Creator: $Creator)"
+        return $true
+    }
+    catch {
+        Write-Log ERROR "Failed to move computer '$ComputerName': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+#endregion
+
+#region Main Execution
+
+function Stop-ScriptExecution {
+    <#
+    .SYNOPSIS
+        Cleanly stops script execution with proper cleanup.
+    #>
+    param(
+        [int]$ExitCode = 0,
+        [string]$Message
+    )
+    
+    if ($Message) {
+        $Level = if ($ExitCode -eq 0) { 'INFO' } else { 'ERROR' }
+        Write-Log $Level $Message
+    }
+    
+    Write-Log INFO "----- AutoMove-Computer Session Ended (Exit Code: $ExitCode) -----"
+    
+    if ($Script:Config.EnableTranscript) {
+        try { Stop-Transcript | Out-Null } catch { }
+    }
+    
+    exit $ExitCode
+}
+
+# Initialize logging and environment
+Start-LoggingSession
 
 try {
-  Write-Log INFO ("Moving: {0}  -->  {1}" -f $ad.DistinguishedName,$TargetOU)
-  Move-ADObject -Identity $ad.DistinguishedName -TargetPath $TargetOU -Confirm:$false
-  $creatorOut = if ($Creator) { $Creator } else { 'n/a' }
-  Write-Log SUCCESS ("Moved {0} to {1} (Creator={2})" -f $ComputerName,$TargetOU,$creatorOut)
-} catch {
-  Write-Log ERROR ("Move failed: {0}" -f $_.Exception.Message)
-  Stop-Transcript | Out-Null; exit 50
+    # Initialize Active Directory module
+    Initialize-ADModule
+    
+    # Determine target computer
+    $Creator = 'Unknown'
+    $EventInfo = $null
+    
+    if ($ComputerName) {
+        Write-Log INFO "Manual override mode: Using ComputerName='$ComputerName'"
+    }
+    else {
+        # Parse RecordId if provided
+        $RecordIdParsed = $null
+        if ($RecordId -and $RecordId -match '^\d+$') {
+            $RecordIdParsed = [long]$RecordId
+        }
+        
+        # Try to get event by RecordId first
+        $Event = $null
+        if ($RecordIdParsed) {
+            $Event = Get-SecurityEvent5137ByRecordId -RecordId $RecordIdParsed
+        }
+        
+        # Fallback to recent event search
+        if (-not $Event) {
+            Write-Log WARN "No event found by RecordId '$RecordId', searching for recent computer creation events"
+            $Event = Get-RecentComputerCreationEvent
+        }
+        
+        if (-not $Event) {
+            Stop-ScriptExecution -ExitCode 20 -Message "No suitable Security Event 5137 found for computer creation"
+        }
+        
+        # Extract computer information from event
+        try {
+            $EventInfo = ConvertFrom-SecurityEvent5137 -Event $Event
+            $ComputerName = $EventInfo.ComputerName
+            $Creator = $EventInfo.Creator
+            
+            Write-Log INFO "Computer from event: Name='$ComputerName', DN='$($EventInfo.DistinguishedName)', Creator='$Creator'"
+        }
+        catch {
+            Stop-ScriptExecution -ExitCode 21 -Message "Failed to extract computer information from event: $($_.Exception.Message)"
+        }
+    }
+    
+    # Wait for AD replication
+    try {
+        $ADComputer = Wait-ForADReplication -ComputerName $ComputerName
+    }
+    catch {
+        Stop-ScriptExecution -ExitCode 30 -Message "Computer '$ComputerName' not found in Active Directory: $($_.Exception.Message)"
+    }
+    
+    # Determine target OU
+    $TargetOU = Resolve-TargetOU -ComputerName $ComputerName
+    if (-not $TargetOU) {
+        Stop-ScriptExecution -ExitCode 0 -Message "No routing rule matched for '$ComputerName' - no action taken"
+    }
+    
+    # Move computer to target OU
+    $MoveResult = Move-ComputerToOU -Computer $ADComputer -TargetOU $TargetOU -Creator $Creator -WhatIf:$Simulate
+    
+    if ($MoveResult) {
+        $Action = if ($Simulate) { "Would move" } else { "Moved" }
+        Stop-ScriptExecution -ExitCode 0 -Message "$Action computer '$ComputerName' successfully"
+    }
+    else {
+        Stop-ScriptExecution -ExitCode 50 -Message "Failed to move computer '$ComputerName'"
+    }
+}
+catch {
+    $ErrorDetails = "Unhandled exception: $($_.Exception.Message)`nStack Trace: $($_.ScriptStackTrace)"
+    Stop-ScriptExecution -ExitCode 99 -Message $ErrorDetails
 }
 
-Stop-Transcript | Out-Null
+#endregion

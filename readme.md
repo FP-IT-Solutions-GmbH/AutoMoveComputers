@@ -1,0 +1,320 @@
+
+# Automatisch neue Computer in OU verschieben
+
+## Überblick
+Dieses Script verschiebt **neu erstellte Computerobjekte** automatisch in die richtige **Active Directory-OU## Logs & Troubleshooting
+
+### Logging (Verbessert in v2.0)
+- **Hauptlog:** `C:\Scripts\Logs\AutoMove-Computer.log`
+- **Transcript:** `C:\Scripts\Logs\Transcript_YYYYMMDD_HHMMSS.txt` (bei EnableTranscript = $true)
+- **Automatische Rotation:** Bei Überschreitung der MaxLogSizeMB wird das Log archiviert
+- **Farbige Konsole:** Log-Level werden farbig in der PowerShell-Konsole angezeigt
+
+### Log-Level
+- **INFO:** Normale Ausführung, Konfiguration, Fortschritt
+- **SUCCESS:** Erfolgreiche Computer-Verschiebung
+- **WARN:** Nicht-kritische Probleme (z.B. Event nicht gefunden, fallback zu recent search)
+- **ERROR:** Kritische Fehler, die zum Skript-Abbruch führen
+- **DEBUG:** Detaillierte Informationen für Fehlerdiagnose
+
+### Exit Codes
+- **0:** Erfolgreiche Ausführung oder Computer bereits am richtigen Ort
+- **10:** ActiveDirectory PowerShell-Modul nicht verfügbar
+- **20:** Kein passendes Security Event 5137 gefunden
+- **21:** Event-Parsing fehlgeschlagen
+- **30:** Computer nach Wartezeit nicht in AD sichtbar
+- **40:** Ziel-OU existiert nicht oder ist nicht zugänglich
+- **50:** Computer-Verschiebung fehlgeschlagen
+- **99:** Unbehandelte Exception
+
+### Häufige Probleme und Lösungen
+
+#### Event nicht gefunden (Exit Code 20)
+```
+WARN: No event found by RecordId '$(EventRecordID)', searching for recent computer creation events
+ERROR: No suitable Security Event 5137 found for computer creation
+```
+**Ursachen:**
+- Task-Makro `$(EventRecordID)` wird nicht korrekt aufgelöst
+- Event wurde auf anderem DC erstellt
+- Zeitfenster zu kurz (EventLookupMinutes erhöhen)
+
+**Lösungen:**
+- Task auf allen DCs einrichten
+- EventLookupMinutes in Config.psd1 erhöhen (Standard: 5 Minuten)
+- Mit `-ComputerName` manuell testen
+
+#### AD-Replikation Timeout (Exit Code 30)
+```
+ERROR: Computer 'ALPHA-PC001' not visible in AD after 60 seconds
+```
+**Ursachen:**
+- Langsame AD-Replikation zwischen DCs
+- Computer wurde sofort nach Erstellung wieder gelöscht
+
+**Lösungen:**
+- ReplicationTimeoutSeconds in Config.psd1 erhöhen
+- Task auf dem DC einrichten, wo Computer erstellt werden
+
+#### Berechtigungsfehler (Exit Code 50)
+```
+ERROR: Failed to move computer 'ALPHA-PC001': Access is denied
+```
+**Lösungen:**
+- Task-Konto benötigt "Move" Berechtigung auf Quell- und Ziel-Container
+- Computer Groups-Membership des Task-Kontos prüfen
+- Delegation auf OU-Ebene einrichten
+
+---
+
+## Deployment & Maintenance (v2.0)
+
+### Empfohlenes Setup
+1. **Skript zentral ablegen:** `C:\Scripts\AutoMove-Computer.ps1`
+2. **Konfiguration anpassen:** `C:\Scripts\Config.psd1` erstellen/editieren
+3. **Logs-Verzeichnis:** `C:\Scripts\Logs\` (wird automatisch erstellt)
+4. **GPO:** Geplante Aufgabe auf Domain Controllers OU verteilen
+
+### Monitoring & Wartung
+```powershell
+# Log-Größe prüfen
+Get-ChildItem "C:\Scripts\Logs\*.log" | Select Name, @{n='SizeMB';e={[math]::Round($_.Length/1MB,2)}}
+
+# Letzte Ausführungen anzeigen
+Get-Content "C:\Scripts\Logs\AutoMove-Computer.log" | Select-String "Session Started" | Select -Last 10
+
+# Erfolgreiche Moves anzeigen
+Get-Content "C:\Scripts\Logs\AutoMove-Computer.log" | Select-String "SUCCESS.*Moved" | Select -Last 20
+
+# Test-Modus für neue Regeln
+.\AutoMove-Computer.ps1 -ComputerName "TestComputer" -Simulate -Verbose
+```
+
+### Performance-Optimierung
+- **MaxEvents reduzieren:** Wenn viele Security Events vorhanden (Standard: 500)
+- **EventLookupMinutes anpassen:** Balance zwischen Zuverlässigkeit und Performance
+- **Transcript deaktivieren:** In Produktionsumgebung (`EnableTranscript = $false`)
+
+---
+
+## Changelog
+
+### Version 2.0 (September 2025)
+**Wesentliche Verbesserungen für bessere Wartbarkeit und Robustheit:**
+
+#### Neue Features
+- **Externe Konfigurationsdatei** (`Config.psd1`) für einfache Anpassungen ohne Script-Änderungen
+- **Automatische Log-Rotation** bei konfigurierbarer Maximalgröße
+- **Erweiterte Parameter-Validierung** mit Parameter Sets
+- **Verbesserte Fehlerbehandlung** mit spezifischen Exit Codes
+- **Farbiges Konsolen-Logging** für bessere Lesbarkeit
+- **Robuste AD-Replikations-Behandlung** mit konfigurierbaren Timeouts
+
+#### Code-Verbesserungen
+- **Modularer Aufbau** mit separaten Funktionsbereichen (#region)
+- **Umfassende Fehlerbehandlung** mit try/catch-Blöcken
+- **Detaillierte Logging-Funktionen** mit verschiedenen Log-Leveln
+- **Parameter-Validierung** mit CmdletBinding und ValidateSet
+- **Bessere Dokumentation** mit ausführlichen Synopsis und Examples
+- **Cleanup-Funktionen** für saubere Script-Beendigung
+
+#### Sicherheit & Stabilität
+- **Validierung der Ziel-OUs** vor Verschiebungsversuchen
+- **Bessere Event-Parsing** mit Fehlerbehandlung für korrupte Events
+- **Timeout-Mechanismen** für AD-Operationen
+- **Detaillierte Error-Reporting** mit Stack Traces
+
+#### Backward Compatibility
+- Alle bestehenden Parameter und Funktionen bleiben unverändert
+- Bestehende Task Scheduler Konfigurationen funktionieren weiterhin
+- Standard-Konfiguration entspricht der ursprünglichen Funktionalität
+
+#### Migration von v1.x
+1. Neue Script-Datei einsetzen
+2. Optional: `Config.psd1` für angepasste Einstellungen erstellen
+3. Keine Änderungen an Task Scheduler oder GPO erforderlich
+
+--- **Namens**.  
+Die Ausführung erfolgt **ereignisgesteuert**, sobald auf dem Domain Controller ein **Security-Event 5137** (Neues Objekt erstellt) protokolliert wird.
+
+**Version 2.0 Highlights:**
+- Verbesserte Fehlerbehandlung und Logging
+- Konfigurationsdatei-Unterstützung (Config.psd1)
+- Automatische Log-Rotation
+- Bessere Parameter-Validierung
+- Erweiterte Simulation und Debug-Modi
+- Robustere AD-Replikations-Behandlung
+
+---
+
+## Funktionsweise 
+- **GPO** aktiviert **Verzeichnisdienständerungen überwachen** (siehe unten).
+- **SACL** auf dem Quellcontainer (`CN=Computers`) löst Event 5137 bei neuer Computererstellung aus.
+- **Geplante Aufgabe** auf jedem DC triggert auf Event 5137 und ruft das PowerShell-Skript auf.
+- Das Skript:
+  1. Liest Name und DN des neu erstellten Computers aus dem Eventlog.
+  2. Prüft anhand von Regex-Regeln, in welche OU der Computer gehört.
+  3. Verschiebt ihn automatisch dorthin (oder in eine Quarantäne-OU, falls kein Match).
+
+---
+
+## Gruppenrichtlinie – Auditing aktivieren
+
+Erstelle eine neue **GPO** und verknüpfe sie mit der **Domain Controllers OU**.
+
+**Pfad:**  
+`Computerkonfiguration → Richtlinien → Windows-Einstellungen → Sicherheitseinstellungen → Erweiterte Überwachungsrichtlinienkonfiguration → Überwachungsrichtlinien → DS-Zugriff`
+
+Aktiviere:
+- **Verzeichnisdienstzugriff überwachen → Erfolgreich**
+- **Verzeichnisdienständerungen überwachen → Erfolgreich**
+
+> Danach `gpupdate /force` auf allen DCs ausführen.
+
+---
+
+## SACL auf Quellcontainer setzen
+Auf `CN=Computers` (oder wo neue Rechner landen):
+1. **Eigenschaften → Sicherheit → Erweitert → Überwachung → Hinzufügen**
+2. Principal: **Jeder**
+3. Anwenden auf: **Dieses Objekt und alle untergeordneten Objekte**
+4. Berechtigung: **Erstellen von Computerobjekten**
+
+Damit wird bei jeder Computererstellung ein Event 5137 geschrieben.
+
+---
+
+## Scheduled Task auf DC einrichten
+
+### Trigger (XML-Filter)
+Benutzerdefiniert → **XML** → *Manuell bearbeiten* aktivieren und einfügen:
+
+```xml
+<QueryList>
+  <Query Id="0" Path="Security">
+    <Select Path="Security">
+      *[System[(EventID=5137)]]
+      and
+      *[EventData[Data[@Name='ObjectClass']='computer']]
+    </Select>
+  </Query>
+</QueryList>
+```
+
+**Optional → nur Objekte aus `CN=Computers` triggern (Domäne anpassen):**
+```xml
+<QueryList>
+  <Query Id="0" Path="Security">
+    <Select Path="Security">
+      *[System[(EventID=5137)]]
+      and
+      *[EventData[Data[@Name='ObjectClass']='computer']]
+      and
+      *[EventData[Data[@Name='ObjectDN'] and contains(.,',CN=Computers,DC=dev,DC=local')]]
+    </Select>
+  </Query>
+</QueryList>
+```
+
+### Aktion
+```
+Programm:  C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+Argumente: -NoProfile -ExecutionPolicy Bypass -File "C:\Scripts\AutoMove-Computer.ps1" -RecordId "$(EventRecordID)"
+Starten in: C:\Scripts
+```
+- **Mit höchsten Privilegien ausführen** aktivieren.
+- Konto mit **Berechtigung zum Verschieben von Computern** verwenden (Delegation auf Quellcontainer und Ziel-OU).
+
+---
+
+## Konfiguration
+
+### Config.psd1 (Neu in v2.0)
+Das Script unterstützt jetzt eine externe Konfigurationsdatei `Config.psd1` im gleichen Verzeichnis:
+
+```powershell
+@{
+    # Logging-Einstellungen
+    LogDir = '.\Logs'
+    MaxLogSizeMB = 10                    # Automatische Log-Rotation
+    EnableTranscript = $true             # PowerShell Transcript für Debug
+    
+    # AD-Replikation
+    ReplicationTimeoutSeconds = 60       # Max. Wartezeit auf AD-Sichtbarkeit
+    ReplicationRetryIntervalSeconds = 5  # Wiederholungsintervall
+    
+    # Event-Verarbeitung
+    EventLookupMinutes = 5              # Fallback: Events der letzten N Minuten
+    MaxEvents = 500                     # Max. Events zum Durchsuchen
+    
+    # Routing-Regeln
+    Rules = @(
+        @{ Pattern = '^Alpha'; OU = 'OU=Location Alpha,...'; Description = 'Alpha Standort' }
+        @{ Pattern = '^Beta';  OU = 'OU=Location Beta,...';  Description = 'Beta Standort' }
+        # ... weitere Regeln
+    )
+}
+```
+
+### Script-Parameter (Erweitert)
+```powershell
+# Standard Task Scheduler Aufruf
+AutoMove-Computer.ps1 -RecordId "$(EventRecordID)"
+
+# Manueller Test mit Simulation
+AutoMove-Computer.ps1 -ComputerName "Alpha-PC001" -Simulate
+
+# Benutzerdefinierte Konfigurationsdatei
+AutoMove-Computer.ps1 -RecordId "12345" -ConfigFile "C:\Custom\MyConfig.psd1"
+```
+
+---
+
+## Anpassung / Erweiterung
+
+### Routing-Regeln anpassen
+**Option 1: Direkt in Config.psd1** (empfohlen)
+```powershell
+Rules = @(
+    @{ Pattern = '^ALPHA-'; OU = 'OU=Alpha Computers,DC=domain,DC=com'; Description = 'Alpha Standort' }
+    @{ Pattern = '^BETA-';  OU = 'OU=Beta Computers,DC=domain,DC=com';  Description = 'Beta Standort' }
+    @{ Pattern = '^LAB-';   OU = 'OU=Lab Systems,DC=domain,DC=com';     Description = 'Labor-PCs' }
+    @{ Pattern = '.*';      OU = 'OU=Quarantine,DC=domain,DC=com';      Description = 'Fallback' }
+)
+```
+
+**Wichtig:** 
+- `Pattern` ist ein **Regex** für den Computernamen
+- Verwende `^` für "beginnt mit" und `$` für "endet mit"
+- Reihenfolge ist wichtig – erste Übereinstimmung gewinnt
+- `.*` am Ende als Fallback für unbekannte Computer
+
+### Erweiterte Beispiele
+```powershell
+# Nach Standort-Prefix
+@{ Pattern = '^(NYC|BOS|ATL)-'; OU = 'OU=US East Coast,DC=corp,DC=com' }
+
+# Nach Computer-Typ
+@{ Pattern = '-VM\d+$'; OU = 'OU=Virtual Machines,DC=corp,DC=com' }
+
+# Mehrere Patterns kombiniert
+@{ Pattern = '^(KIOSK|INFO|DISPLAY)-'; OU = 'OU=Public Systems,DC=corp,DC=com' }
+```
+
+---
+
+## Logs & Troubleshooting
+- Logs liegen in `C:\Scripts\Logs\AutoMove-Computer.log` (plus Transcripts).
+- Task-Historie: **201 Action completed** mit Rückgabecode **0** = OK.
+- Häufige Fehler:
+  - Task ohne „Starten in“ → Skript/Log nicht gefunden.
+  - Event entsteht auf anderem DC → Task auf **allen DCs** ausrollen.
+  - Fehlende Rechte → Delegation auf Quellcontainer/Ziel-OU prüfen.
+
+---
+
+## Deployment-Tipp
+- **Empfohlen:** GPO-Preferences → Geplante Aufgabe auf **Domain Controllers OU** verteilen, damit sie auf allen DCs existiert.
+- Skript zentral (z. B. `C:\Scripts`) per GPO oder Softwareverteilung auf alle DCs kopieren.
+
+---
