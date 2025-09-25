@@ -291,10 +291,10 @@ ERROR: Failed to move computer 'ALPHA-PC001': Access is denied
 
 ## Dateien
 
-- **`AutoMove-Computer-Polling.ps1`** - Hauptscript (Polling-Variante)
+- **`AutoMove-Computer-Polling.ps1`** - Hauptscript (Polling-Variante v3.1)
 - **`Config-Polling.psd1`** - Konfigurationsdatei für Polling
 - **`Test-AutoMovePolling.ps1`** - Test-Utility für Konfiguration
-- **`processed_computers.json`** - Tracking bereits verarbeiteter Computer
+- **AD extensionAttribute7** - Tracking bereits verarbeiteter Computer (im AD gespeichert)
 
 ## Schnellstart
 

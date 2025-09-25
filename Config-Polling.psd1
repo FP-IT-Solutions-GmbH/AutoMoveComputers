@@ -7,8 +7,7 @@
     # Polling configuration
     PollIntervalMinutes = 3               # How often to run the polling cycle
     LookbackMinutes = 10                  # How far back to search for new computers
-    ProcessedComputersFile = 'processed_computers.json'  # History tracking file
-    MaxProcessedHistoryDays = 30          # How long to keep processed computer history
+    MaxProcessedHistoryDays = 30          # How long to keep processed status in AD (extensionAttribute7)
     
     # Error handling and retry
     RetryFailedMoves = $true              # Retry failed computer moves

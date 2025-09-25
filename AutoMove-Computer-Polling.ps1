@@ -29,9 +29,10 @@
     Override polling interval for testing (polls every minute).
 
 .NOTES
-    Version: 3.0 (Polling-Based)
+    Version: 3.1 (Polling-Based with AD Tracking)
     Requires: ActiveDirectory PowerShell module
     Log Location: .\Logs\AutoMove-Computer-Polling.log
+    Tracking: Uses extensionAttribute7 in AD (no external files)
     
     Scheduled Task Setup:
     - Run every 2-3 minutes
@@ -42,7 +43,7 @@
     - 100% coverage regardless of creation DC
     - No replication timing issues  
     - Single deployment point
-    - Duplicate prevention built-in
+    - Self-managing AD-based tracking (no file dependencies)
     - Better error handling and retry logic
 #>
 
@@ -223,48 +224,65 @@ function Get-AllDomainControllers {
 
 #region Computer Discovery Functions
 
-function Get-ProcessedComputersHistory {
-    $ProcessedFile = Join-Path $Script:ScriptDir $Script:Config.ProcessedComputersFile
-    
-    if (-not (Test-Path $ProcessedFile)) {
-        Write-Log INFO "No processed computers history found, starting fresh"
-        return @{}
-    }
+function Test-ComputerProcessed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
     
     try {
-        $Content = Get-Content $ProcessedFile -Raw | ConvertFrom-Json -AsHashtable
+        $Computer = Get-ADComputer -Identity $ComputerName -Properties extensionAttribute7 -ErrorAction Stop
         
-        # Clean up old entries
-        $CutoffDate = (Get-Date).AddDays(-$Script:Config.MaxProcessedHistoryDays)
-        $CleanedContent = @{}
-        
-        foreach ($ComputerName in $Content.Keys) {
-            $ProcessedDate = [DateTime]$Content[$ComputerName].ProcessedDate
-            if ($ProcessedDate -gt $CutoffDate) {
-                $CleanedContent[$ComputerName] = $Content[$ComputerName]
-            }
+        if ([string]::IsNullOrEmpty($Computer.extensionAttribute7)) {
+            return $false
         }
         
-        Write-Log INFO "Loaded $($CleanedContent.Count) processed computers from history (cleaned $($Content.Count - $CleanedContent.Count) old entries)"
-        return $CleanedContent
+        # Check if processed within retention period
+        $ProcessedDate = [DateTime]::Parse($Computer.extensionAttribute7)
+        $CutoffDate = (Get-Date).AddDays(-$Script:Config.MaxProcessedHistoryDays)
+        
+        if ($ProcessedDate -lt $CutoffDate) {
+            Write-Log DEBUG "Computer '$ComputerName' processed too long ago ($ProcessedDate), will reprocess"
+            return $false
+        }
+        
+        Write-Log DEBUG "Computer '$ComputerName' already processed on $ProcessedDate"
+        return $true
     }
     catch {
-        Write-Log WARN "Failed to load processed computers history: $($_.Exception.Message)"
-        return @{}
+        Write-Log DEBUG "Computer '$ComputerName' not found or error checking processed status: $($_.Exception.Message)"
+        return $false
     }
 }
 
-function Save-ProcessedComputersHistory {
-    param([hashtable]$ProcessedComputers)
+function Mark-ComputerProcessed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+        
+        [Parameter(Mandatory)]
+        [string]$Result,
+        
+        [string]$TargetOU = $null,
+        
+        [switch]$WhatIf
+    )
     
-    $ProcessedFile = Join-Path $Script:ScriptDir $Script:Config.ProcessedComputersFile
+    $ProcessedTimestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    
+    if ($WhatIf) {
+        Write-Log DEBUG "[SIMULATION] Would mark '$ComputerName' as processed with result: $Result"
+        return
+    }
     
     try {
-        $ProcessedComputers | ConvertTo-Json -Depth 3 | Set-Content $ProcessedFile -Encoding UTF8
-        Write-Log DEBUG "Saved processed computers history ($($ProcessedComputers.Count) entries)"
+        Set-ADComputer -Identity $ComputerName -Replace @{extensionAttribute7 = $ProcessedTimestamp} -ErrorAction Stop
+        Write-Log DEBUG "Marked computer '$ComputerName' as processed ($Result) at $ProcessedTimestamp"
     }
     catch {
-        Write-Log ERROR "Failed to save processed computers history: $($_.Exception.Message)"
+        Write-Log WARN "Failed to mark computer '$ComputerName' as processed: $($_.Exception.Message)"
     }
 }
 
@@ -301,12 +319,11 @@ function Find-NewComputersOnAllDCs {
 }
 
 function Get-UnprocessedComputers {
-    $ProcessedComputers = Get-ProcessedComputersHistory
     $NewComputers = Find-NewComputersOnAllDCs
     
-    # Filter out already processed computers
+    # Filter out already processed computers using extensionAttribute7
     $UnprocessedComputers = $NewComputers | Where-Object { 
-        -not $ProcessedComputers.ContainsKey($_.Name) 
+        -not (Test-ComputerProcessed -ComputerName $_.Name)
     }
     
     Write-Log INFO "Found $($UnprocessedComputers.Count) unprocessed computer(s) requiring OU placement"
@@ -407,10 +424,7 @@ function Process-Computer {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        $Computer,
-        
-        [Parameter(Mandatory)]
-        [hashtable]$ProcessedComputers
+        $Computer
     )
     
     $ComputerName = $Computer.Name
@@ -422,24 +436,16 @@ function Process-Computer {
         Write-Log WARN "No routing rule matched for '$ComputerName' - skipping"
         
         # Mark as processed (even though no rule matched) to avoid re-processing
-        $ProcessedComputers[$ComputerName] = @{
-            ProcessedDate = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            Result = 'NoRuleMatched'
-            TargetOU = $null
-        }
+        Mark-ComputerProcessed -ComputerName $ComputerName -Result 'NoRuleMatched' -WhatIf:$Simulate
         return $true
     }
     
     # Attempt to move computer
     $MoveResult = Move-ComputerToOU -Computer $Computer -TargetOU $TargetOU -WhatIf:$Simulate
     
-    # Record result
-    $ProcessedComputers[$ComputerName] = @{
-        ProcessedDate = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-        Result = if ($MoveResult) { 'Success' } else { 'Failed' }
-        TargetOU = $TargetOU
-        Simulation = [bool]$Simulate
-    }
+    # Mark as processed with result
+    $Result = if ($MoveResult) { 'Success' } else { 'Failed' }
+    Mark-ComputerProcessed -ComputerName $ComputerName -Result $Result -TargetOU $TargetOU -WhatIf:$Simulate
     
     return $MoveResult
 }
@@ -475,15 +481,11 @@ try {
     # Initialize Active Directory module
     Initialize-ADModule
     
-    # Load processed computers history
-    $ProcessedComputers = Get-ProcessedComputersHistory
-    
     # Find computers that need processing
     $UnprocessedComputers = Get-UnprocessedComputers
     
     if ($UnprocessedComputers.Count -eq 0) {
         Write-Log INFO "No unprocessed computers found - nothing to do"
-        Save-ProcessedComputersHistory -ProcessedComputers $ProcessedComputers
         Stop-ScriptExecution -ExitCode 0 -Message "Polling cycle completed - no new computers"
     }
     
@@ -493,7 +495,7 @@ try {
     
     foreach ($Computer in $UnprocessedComputers) {
         try {
-            if (Process-Computer -Computer $Computer -ProcessedComputers $ProcessedComputers) {
+            if (Process-Computer -Computer $Computer) {
                 $SuccessCount++
             } else {
                 $FailureCount++
@@ -504,16 +506,9 @@ try {
             $FailureCount++
             
             # Still mark as processed to avoid infinite retries
-            $ProcessedComputers[$Computer.Name] = @{
-                ProcessedDate = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-                Result = 'Error'
-                Error = $_.Exception.Message
-            }
+            Mark-ComputerProcessed -ComputerName $Computer.Name -Result 'Error' -WhatIf:$Simulate
         }
     }
-    
-    # Save updated processed computers history
-    Save-ProcessedComputersHistory -ProcessedComputers $ProcessedComputers
     
     # Report results
     $TotalProcessed = $SuccessCount + $FailureCount
