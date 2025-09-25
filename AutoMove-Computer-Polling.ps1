@@ -166,14 +166,41 @@ function Write-Log {
 }
 
 function Start-LoggingSession {
-    Write-Log INFO "----- AutoMove-Computer-Polling Session Started -----"
-    Write-Log INFO "Host: $env:COMPUTERNAME"
-    Write-Log INFO "User: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-    Write-Log INFO "PowerShell: $($PSVersionTable.PSVersion)"
-    Write-Log INFO "Script: $Script:ScriptPath"
-    Write-Log INFO "Mode: $(if ($Simulate) { 'SIMULATION' } else { 'PRODUCTION' })"
-    Write-Log INFO "Poll Interval: $($Script:Config.PollIntervalMinutes) minutes"
-    Write-Log INFO "Lookback Window: $($Script:Config.LookbackMinutes) minutes"
+    # Generate unique session identifier for tracking
+    $SessionId = [guid]::NewGuid().ToString().Substring(0,8).ToUpper()
+    $Script:SessionId = $SessionId
+    $Script:SessionStartTime = Get-Date
+    
+    # Session Header with ASCII box drawing
+    Write-Log INFO "=================================================================================="
+    Write-Log INFO "                     AutoMove-Computer-Polling Session Started"
+    Write-Log INFO "=================================================================================="
+    Write-Log INFO "Session ID: $SessionId"
+    Write-Log INFO "Start Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')"
+    Write-Log INFO " "
+    
+    # Host Information Section
+    Write-Log INFO "HOST INFORMATION:"
+    Write-Log INFO "  |-- Hostname: $env:COMPUTERNAME"
+    Write-Log INFO "  |-- Domain: $(try { (Get-WmiObject Win32_ComputerSystem).Domain } catch { 'Unknown' })"
+    Write-Log INFO "  |-- Operating User: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+    Write-Log INFO "  |-- PowerShell Version: $($PSVersionTable.PSVersion) [$($PSVersionTable.PSEdition)]"
+    Write-Log INFO "  |-- OS Version: $(try { (Get-WmiObject Win32_OperatingSystem).Caption } catch { 'Unknown' })"
+    Write-Log INFO " "
+    
+    # Execution Context Section
+    Write-Log INFO "EXECUTION CONTEXT:"
+    Write-Log INFO "  |-- Script Path: $Script:ScriptPath"
+    Write-Log INFO "  |-- Working Directory: $(Get-Location)"
+    Write-Log INFO "  |-- Config File: $Script:ConfigFile"
+    Write-Log INFO "  |-- Log Directory: $($Script:Config.LogDir)"
+    Write-Log INFO "  |-- Execution Mode: $(if ($Simulate) { 'SIMULATION (No Changes)' } else { 'PRODUCTION (Live Changes)' })"
+    Write-Log INFO " "
+    
+    # Configuration Parameters Section
+    Write-Log INFO "CONFIGURATION PARAMETERS:"
+    Write-Log INFO "  |-- Poll Interval: $($Script:Config.PollIntervalMinutes) minutes"
+    Write-Log INFO "  |-- Lookback Window: $($Script:Config.LookbackMinutes) minutes"
     
     if ($Script:Config.EnableTranscript) {
         try {
@@ -210,12 +237,33 @@ function Initialize-ADModule {
 
 function Get-AllDomainControllers {
     try {
-        $DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name | Sort-Object
-        Write-Log INFO "Discovered $($DCs.Count) domain controllers: $($DCs -join ', ')"
+        Write-Log INFO "DOMAIN CONTROLLER DISCOVERY:"
+        $DiscoveryStart = Get-Date
+        
+        $DCObjects = Get-ADDomainController -Filter *
+        $DCs = $DCObjects.Name | Sort-Object
+        
+        $DiscoveryDuration = ((Get-Date) - $DiscoveryStart).TotalMilliseconds
+        
+        Write-Log INFO "  |-- Discovery Method: LDAP query via Get-ADDomainController"
+        Write-Log INFO "  |-- Query Duration: $([math]::Round($DiscoveryDuration))ms"
+        Write-Log INFO "  |-- Domain Controllers Found: $($DCs.Count)"
+        
+        foreach ($DC in $DCObjects) {
+            $RoleInfo = @()
+            if ($DC.OperationMasterRoles) { $RoleInfo += "FSMO: $($DC.OperationMasterRoles -join ',')" }
+            if ($DC.IsGlobalCatalog) { $RoleInfo += "GC" }
+            if ($DC.IsReadOnly) { $RoleInfo += "RODC" }
+            
+            $Roles = if ($RoleInfo.Count -gt 0) { " ($($RoleInfo -join ', '))" } else { "" }
+            Write-Log DEBUG "    * $($DC.Name)$Roles - Site: $($DC.Site)"
+        }
+        
         return $DCs
     }
     catch {
-        Write-Log ERROR "Failed to enumerate domain controllers: $($_.Exception.Message)"
+        Write-Log ERROR "Domain Controller discovery failed: $($_.Exception.Message)"
+        Write-Log DEBUG "  |-- Error Type: $($_.Exception.GetType().Name)"
         throw
     }
 }
@@ -292,29 +340,80 @@ function Find-NewComputersOnAllDCs {
     $LookbackTime = (Get-Date).AddMinutes(-$Script:Config.LookbackMinutes)
     $AllNewComputers = @()
     
-    Write-Log INFO "Scanning for computers created after $LookbackTime in default container"
+    Write-Log INFO " "
+    Write-Log INFO "COMPUTER DISCOVERY OPERATION:"
+    Write-Log INFO "  |-- Search Base: $DefaultComputersContainer"
+    Write-Log INFO "  |-- Time Filter: Computers created after $($LookbackTime.ToString('yyyy-MM-dd HH:mm:ss.fff'))"
+    Write-Log INFO "  |-- Domain Controllers to Query: $($AllDCs.Count)"
+    Write-Log INFO " "
+    
+    $DCResults = @{}
+    $TotalDCs = $AllDCs.Count
+    $SuccessfulDCs = 0
+    $FailedDCs = 0
     
     foreach ($DC in $AllDCs) {
+        $DCStart = Get-Date
         try {
             Write-Log DEBUG "Querying DC: $DC"
             
             # Query for computers created recently in the default Computers container
             $Computers = Get-ADComputer -Server $DC -Filter "whenCreated -gt '$($LookbackTime.ToString('yyyy-MM-dd HH:mm:ss'))'" -SearchBase $DefaultComputersContainer -Properties whenCreated, DistinguishedName -ErrorAction Stop
             
+            $DCDuration = ((Get-Date) - $DCStart).TotalMilliseconds
+            $DCResults[$DC] = @{
+                Success = $true
+                ComputerCount = $Computers.Count
+                Duration = $DCDuration
+            }
+            
+            $SuccessfulDCs++
+            
             if ($Computers) {
-                Write-Log DEBUG "Found $($Computers.Count) recent computer(s) on DC '$DC'"
+                Write-Log DEBUG "    + DC ${DC}: Found $($Computers.Count) computers ($([math]::Round($DCDuration))ms)"
                 $AllNewComputers += $Computers
+            } else {
+                Write-Log DEBUG "    o DC ${DC}: No new computers found ($([math]::Round($DCDuration))ms)"
             }
         }
         catch {
-            Write-Log WARN "Failed to query DC '$DC': $($_.Exception.Message)"
+            $DCDuration = ((Get-Date) - $DCStart).TotalMilliseconds
+            $DCResults[$DC] = @{
+                Success = $false
+                ComputerCount = 0
+                Duration = $DCDuration
+                Error = $_.Exception.Message
+            }
+            
+            $FailedDCs++
+            Write-Log ERROR "    - DC ${DC}: Query failed - $($_.Exception.Message)"
         }
     }
+    
+    # Calculate summary statistics
+    $TotalQueryTime = ($DCResults.Values | Measure-Object -Property Duration -Sum).Sum
+    
+    Write-Log INFO " "
+    Write-Log INFO "DISCOVERY SUMMARY:"
+    Write-Log INFO "  |-- DCs Queried: $SuccessfulDCs/$TotalDCs successful ($FailedDCs failed)"
+    Write-Log INFO "  |-- Total Query Time: $([math]::Round($TotalQueryTime))ms"
+    Write-Log INFO "  |-- Average Query Time: $([math]::Round($TotalQueryTime / $TotalDCs))ms per DC"
+    Write-Log INFO "  |-- Raw Computer Results: $($AllNewComputers.Count) objects"
     
     # Remove duplicates (same computer found on multiple DCs)
     $UniqueComputers = $AllNewComputers | Sort-Object Name, whenCreated | Get-Unique -AsString
     
-    Write-Log INFO "Found $($UniqueComputers.Count) unique new computer(s) across all DCs"
+    Write-Log INFO "  |-- Unique Computers After Deduplication: $($UniqueComputers.Count)"
+    
+    if ($AllNewComputers.Count -ne $UniqueComputers.Count) {
+        $Duplicates = $AllNewComputers.Count - $UniqueComputers.Count
+        Write-Log DEBUG "    Removed $Duplicates duplicate entries from multi-DC results"
+    }
+    
+    Write-Log INFO " "
+    Write-Log INFO "PROCESSING FILTER RESULTS:"
+    Write-Log INFO "  |-- New Computers Found: $($UniqueComputers.Count)"
+    
     return $UniqueComputers
 }
 
@@ -460,12 +559,29 @@ function Stop-ScriptExecution {
         [string]$Message
     )
     
+    # Calculate session duration
+    $SessionEnd = Get-Date
+    $SessionDuration = if ($Script:SessionStartTime) { 
+        ($SessionEnd - $Script:SessionStartTime).TotalSeconds 
+    } else { 
+        0 
+    }
+    
+    # Log exit reason if provided
     if ($Message) {
         $Level = if ($ExitCode -eq 0) { 'INFO' } else { 'ERROR' }
         Write-Log $Level $Message
     }
     
-    Write-Log INFO "----- AutoMove-Computer-Polling Session Ended (Exit Code: $ExitCode) -----"
+    Write-Log INFO " "
+    Write-Log INFO "=================================================================================="
+    Write-Log INFO "                     AutoMove-Computer-Polling Session Ended"
+    Write-Log INFO "=================================================================================="
+    Write-Log INFO "Session ID: $($Script:SessionId)"
+    Write-Log INFO "End Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')"
+    Write-Log INFO "Total Duration: $([math]::Round($SessionDuration, 2)) seconds"
+    Write-Log INFO "Exit Code: $ExitCode $(if ($ExitCode -eq 0) { '(Success)' } elseif ($ExitCode -eq 99) { '(Critical Error)' } else { '(Error)' })"
+    Write-Log INFO "=================================================================================="
     
     if ($Script:Config.EnableTranscript) {
         try { Stop-Transcript | Out-Null } catch { }
@@ -489,14 +605,28 @@ try {
         Stop-ScriptExecution -ExitCode 0 -Message "Polling cycle completed - no new computers"
     }
     
-    # Process each computer
+    # Process each computer with detailed metrics
+    Write-Log INFO " "
+    Write-Log INFO "BATCH PROCESSING INITIATED:"
+    Write-Log INFO "  |-- Queue Size: $($UnprocessedComputers.Count) computers"
+    Write-Log INFO "  |-- Execution Mode: $(if ($Simulate) { 'SIMULATION' } else { 'PRODUCTION' })"
+    Write-Log INFO " "
+    
     $SuccessCount = 0
     $FailureCount = 0
+    $ProcessingTimes = @()
+    $BatchStart = Get-Date
     
     foreach ($Computer in $UnprocessedComputers) {
+        $ComputerStart = Get-Date
         try {
+            Write-Log INFO "[$($SuccessCount + $FailureCount + 1)/$($UnprocessedComputers.Count)] Processing: $($Computer.Name)"
+            
             if (Process-Computer -Computer $Computer) {
                 $SuccessCount++
+                $ProcessingTime = ((Get-Date) - $ComputerStart).TotalMilliseconds
+                $ProcessingTimes += $ProcessingTime
+                Write-Log DEBUG "  Processing completed in $([math]::Round($ProcessingTime))ms"
             } else {
                 $FailureCount++
             }
@@ -510,9 +640,20 @@ try {
         }
     }
     
-    # Report results
+    # Calculate comprehensive batch statistics
+    $BatchEnd = Get-Date
+    $BatchDuration = ($BatchEnd - $BatchStart).TotalSeconds
     $TotalProcessed = $SuccessCount + $FailureCount
-    Write-Log INFO "Processing complete - Success: $SuccessCount, Failed: $FailureCount, Total: $TotalProcessed"
+    $SuccessRate = if ($TotalProcessed -gt 0) { ($SuccessCount / $TotalProcessed * 100) } else { 0 }
+    
+    Write-Log INFO " "
+    Write-Log INFO "BATCH PROCESSING COMPLETE:"
+    Write-Log INFO "  |-- Duration: $([math]::Round($BatchDuration, 1)) seconds"
+    Write-Log INFO "  |-- Computers Processed: $TotalProcessed"
+    Write-Log INFO "  |-- Successful: $SuccessCount ($([math]::Round($SuccessRate, 1))%)"
+    Write-Log INFO "  |-- Failed: $FailureCount"
+    Write-Log INFO "  |-- Average Processing Time: $([math]::Round(($ProcessingTimes | Measure-Object -Average).Average))ms per computer"
+    Write-Log INFO "  |-- Throughput: $([math]::Round($TotalProcessed / $BatchDuration, 2)) computers/second"
     
     if ($Simulate) {
         Stop-ScriptExecution -ExitCode 0 -Message "SIMULATION: All computers would be processed successfully"
