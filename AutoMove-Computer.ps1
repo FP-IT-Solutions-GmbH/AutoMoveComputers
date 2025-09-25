@@ -74,6 +74,11 @@ $Script:Config = @{
     EventLookupMinutes = 5
     MaxEvents = 500
     EnableTranscript = $true
+    # Multi-DC Configuration
+    EnableMultiDCFallback = $true
+    DCLookupTimeoutSeconds = 15
+    QueryOriginatingDCFirst = $true
+    FallbackToAllDCs = $true
 }
 
 # Load external config if specified or exists
@@ -359,7 +364,7 @@ function Resolve-TargetOU {
 function Wait-ForADReplication {
     <#
     .SYNOPSIS
-        Waits for computer object to become visible in AD after creation.
+        Waits for computer object to become visible in AD with multi-DC support.
     #>
     [CmdletBinding()]
     param(
@@ -370,26 +375,57 @@ function Wait-ForADReplication {
         [int]$RetryIntervalSeconds = $Script:Config.ReplicationRetryIntervalSeconds
     )
     
-    Write-Log INFO "Waiting for AD replication of computer: $ComputerName (timeout: ${TimeoutSeconds}s)"
+    Write-Log INFO "Searching for computer with multi-DC support: $ComputerName (timeout: ${TimeoutSeconds}s)"
     
     $MaxRetries = [math]::Ceiling($TimeoutSeconds / $RetryIntervalSeconds)
     
-    for ($Attempt = 1; $Attempt -le $MaxRetries; $Attempt++) {
+    # First try current DC multiple times
+    for ($Attempt = 1; $Attempt -le [math]::Min($MaxRetries, 3); $Attempt++) {
         try {
             $Computer = Get-ADComputer -Identity $ComputerName -Properties DistinguishedName, whenCreated -ErrorAction Stop
-            Write-Log SUCCESS "Computer '$ComputerName' found in AD after $($Attempt * $RetryIntervalSeconds) seconds"
+            Write-Log SUCCESS "Computer '$ComputerName' found on current DC (attempt $Attempt)"
             return $Computer
         }
-        catch {
-            if ($Attempt -eq $MaxRetries) {
-                Write-Log ERROR "Computer '$ComputerName' not visible in AD after $TimeoutSeconds seconds"
-                throw "AD replication timeout for computer: $ComputerName"
-            }
-            
-            Write-Log DEBUG "Attempt $Attempt of $MaxRetries`: Computer not yet visible, waiting ${RetryIntervalSeconds}s..."
-            Start-Sleep -Seconds $RetryIntervalSeconds
+        catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+            Write-Log DEBUG "Attempt $Attempt of 3: Computer not found on current DC, waiting ${RetryIntervalSeconds}s..."
+            if ($Attempt -lt 3) { Start-Sleep -Seconds $RetryIntervalSeconds }
         }
     }
+    
+    # If multi-DC fallback is enabled, try other DCs
+    if ($Script:Config.EnableMultiDCFallback) {
+        Write-Log INFO "Current DC search failed, trying multi-DC fallback"
+        
+        try {
+            # Get list of available domain controllers
+            $DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name
+            Write-Log INFO "Found $($DCs.Count) domain controllers for fallback search"
+            
+            foreach ($DC in $DCs) {
+                # Skip current machine to avoid duplicate search
+                if ($DC -eq $env:COMPUTERNAME) { continue }
+                
+                try {
+                    Write-Log DEBUG "Trying DC: $DC"
+                    $Computer = Get-ADComputer -Identity $ComputerName -Properties DistinguishedName, whenCreated -Server $DC -ErrorAction Stop
+                    Write-Log SUCCESS "Computer '$ComputerName' found on DC '$DC' via multi-DC fallback"
+                    return $Computer
+                }
+                catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+                    Write-Log DEBUG "Computer not found on DC '$DC'"
+                }
+                catch {
+                    Write-Log WARN "Error querying DC '$DC': $($_.Exception.Message)"
+                }
+            }
+        }
+        catch {
+            Write-Log WARN "Failed to enumerate domain controllers: $($_.Exception.Message)"
+        }
+    }
+    
+    Write-Log ERROR "Computer '$ComputerName' not found on any available domain controller"
+    throw "Computer not found in multi-DC environment: $ComputerName"
 }
 
 function Test-ADOrganizationalUnit {

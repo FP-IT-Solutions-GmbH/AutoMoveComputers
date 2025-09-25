@@ -12,6 +12,12 @@
     EventLookupMinutes = 5
     MaxEvents = 500
     
+    # Multi-DC environment settings (v2.2)
+    EnableMultiDCFallback = $true         # Enable fallback to other DCs when computer not found
+    DCLookupTimeoutSeconds = 15           # Timeout for individual DC queries
+    QueryOriginatingDCFirst = $true       # Try the DC that logged the event first
+    FallbackToAllDCs = $true              # Search all DCs if computer not found on current DC
+    
     # Computer routing rules
     # Pattern: Regular expression to match computer names
     # OU: Target Organizational Unit distinguished name
